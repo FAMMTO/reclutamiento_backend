@@ -1,0 +1,267 @@
+openapi: "3.0.3"
+info:
+  title: Jobbly API
+  description: >
+    Backend de reclutamiento Jobbly (Go + PostgreSQL). Contrato consumido por
+    el frontend RECLUTAMIENTO-AI. La sesión usa access token JWT (Bearer, 15
+    min) + refresh token rotativo en cookie httpOnly `jobbly_refresh`
+    (Path=/api/v1/auth).
+  version: "0.1.0"
+
+servers:
+  - url: http://localhost:4000
+    description: Desarrollo local
+  - url: https://api.jobbly.mx
+    description: Producción (VPS)
+
+tags:
+  - name: auth
+  - name: recruiters
+  - name: ops
+
+paths:
+  /healthz:
+    get:
+      tags: [ops]
+      summary: Liveness
+      responses:
+        "200": { description: ok }
+  /readyz:
+    get:
+      tags: [ops]
+      summary: Readiness (incluye ping a Postgres)
+      responses:
+        "200": { description: ok }
+        "503": { description: base de datos no disponible }
+
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Iniciar sesión
+      description: >
+        Rate limit estricto por IP (10/min). Si `recruiter.passwordChanged`
+        es false, el cliente debe forzar el cambio de contraseña antes de
+        usar el resto del API (los endpoints protegidos responden 403
+        `password_change_required`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        "200":
+          description: Sesión creada. Set-Cookie `jobbly_refresh` (httpOnly).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [auth]
+      summary: Renovar sesión (rotación de refresh token)
+      description: >
+        Usa la cookie `jobbly_refresh`. El token presentado se revoca y se
+        emite uno nuevo (rotación). Presentar un token ya revocado se trata
+        como robo y revoca todas las sesiones del usuario.
+      responses:
+        "200":
+          description: Nueva sesión. Set-Cookie con el refresh rotado.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: Cerrar sesión (revoca el refresh y limpia la cookie)
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { ok: { type: boolean } }
+
+  /api/v1/auth/me:
+    get:
+      tags: [auth]
+      summary: Perfil del reclutador autenticado
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  recruiter: { $ref: "#/components/schemas/Recruiter" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /api/v1/auth/change-password:
+    post:
+      tags: [auth]
+      summary: Cambiar contraseña (obligatorio si es temporal)
+      description: >
+        Valida la contraseña actual, aplica la política (≥10 caracteres,
+        letras y números), marca `passwordChanged=true` y revoca todas las
+        sesiones anteriores emitiendo una nueva.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword: { type: string }
+                newPassword: { type: string, minLength: 10 }
+      responses:
+        "200":
+          description: Contraseña cambiada; nueva sesión emitida.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /api/v1/recruiters:
+    get:
+      tags: [recruiters]
+      summary: Listar reclutadores de la organización
+      description: Requiere rol Administrador y contraseña definitiva.
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  recruiters:
+                    type: array
+                    items: { $ref: "#/components/schemas/Recruiter" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+    post:
+      tags: [recruiters]
+      summary: Dar de alta un reclutador
+      description: >
+        Solo Administradores. El nuevo reclutador nace con
+        `passwordChanged=false` y debe cambiar la contraseña temporal en su
+        primer login.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, temporaryPassword, permission]
+              properties:
+                name: { type: string, description: "Solo letras y espacios" }
+                email: { type: string, format: email }
+                phone: { type: string, description: "Dígitos, + y espacios" }
+                temporaryPassword: { type: string, minLength: 8 }
+                permission:
+                  type: string
+                  enum: [Administrador, Ejecutivo]
+      responses:
+        "201":
+          description: Creado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  recruiter: { $ref: "#/components/schemas/Recruiter" }
+        "400": { $ref: "#/components/responses/Error" }
+        "409":
+          description: Email ya registrado (`email_taken`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  /api/v1/recruiters/{id}:
+    patch:
+      tags: [recruiters]
+      summary: Activar / desactivar un reclutador
+      description: >
+        Solo Administradores. Desactivar revoca las sesiones abiertas del
+        usuario. No es posible desactivar la propia cuenta
+        (`self_deactivation`).
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [isActive]
+              properties:
+                isActive: { type: boolean }
+      responses:
+        "200":
+          description: ok
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  responses:
+    Error:
+      description: Error con sobre uniforme
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+
+    Recruiter:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        organizationId: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string }
+        permission: { type: string, enum: [Administrador, Ejecutivo] }
+        isActive: { type: boolean }
+        passwordChanged: { type: boolean }
+        createdBy: { type: string, format: uuid, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    Session:
+      type: object
+      properties:
+        accessToken: { type: string, description: "JWT Bearer, 15 minutos" }
+        recruiter: { $ref: "#/components/schemas/Recruiter" }

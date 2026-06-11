@@ -19,9 +19,9 @@ Plan maestro: `../PLAN_DE_ACCION.md` (arquitectura, esquema de DB, fases y crite
 
 ## Grafo del proyecto
 
-> Última actualización: 2026-06-10 — Fase 1 implementada y verificada end-to-end
-> (auth completa + gestión de reclutadores). Lo ⬜ es la arquitectura objetivo
-> (PLAN_DE_ACCION.md §2.1) y se va marcando ✅ conforme se construya.
+> Última actualización: 2026-06-10 — Fases 1, 2 y 3 implementadas y verificadas
+> end-to-end (auth, reclutadores, compañías, vacantes, rutas, candidatos y
+> postulaciones). Lo ⬜ es lo que falta (PLAN_DE_ACCION.md) y se marca ✅ al construirse.
 
 Estado de nodos: ⬜ planeado · ✅ implementado
 
@@ -35,12 +35,11 @@ graph TD
     subgraph "internal/ (dominios)"
         AUTH["✅ auth (argon2id, JWT 15min,<br/>refresh rotativo + detección de robo,<br/>RBAC, cambio obligatorio de contraseña)"]
         REC["✅ recruiters (alta admin-only,<br/>activar/desactivar, org-scoped)"]
-        CMP["⬜ companies"]
-        POS["⬜ positions"]
-        VAC["⬜ vacancies"]
-        CAN["⬜ candidates + applications"]
+        CMP["✅ companies (admin-only,<br/>find-or-create desde vacantes)"]
+        VAC["✅ vacancies (ciclo draft→published→closed,<br/>filtros/paginación, vista pública)"]
+        CAN["✅ candidates (upsert por org+teléfono,<br/>postulación pública, pipeline de estados)"]
+        RUT["✅ rutas (CRUD + N:M ruta_vacancies)"]
         FBA["⬜ facebookads (Graph API server-side)"]
-        CAT["⬜ catalogs (estados/municipios MX)"]
     end
 
     subgraph "internal/platform"
@@ -52,30 +51,43 @@ graph TD
         CRY["⬜ crypto (AES-GCM secretos Meta)"]
     end
 
-    PG[("✅ PostgreSQL 16<br/>0001_init: organizations, recruiters,<br/>refresh_tokens, audit_log")]
+    PG[("✅ PostgreSQL 16<br/>0001: organizations, recruiters, refresh_tokens, audit_log<br/>0002: companies, vacancies, rutas, ruta_vacancies<br/>0003: candidates, applications")]
     RIVER["⬜ river (cola de jobs en Postgres)"]
     META["Meta Graph API"]
     FE["✅ Frontend RECLUTAMIENTO-AI<br/>(src/lib/api/* consume este API;<br/>contrato: api/openapi.yaml)"]
 
     API --> HTTPS & CFG & DB
-    API --> AUTH & REC
-    API -.-> CMP & POS & VAC & CAN & FBA & CAT
+    API --> AUTH & REC & CMP & VAC & CAN & RUT
     WRK -.-> FBA & RIVER
     AUTH --> WEB & AUD & HTTPS
     REC --> AUTH & WEB & AUD & HTTPS
-    POS -.-> CMP
-    VAC -.-> POS & CMP
-    CAN -.-> VAC
+    VAC --> CMP
+    CAN --> VAC
+    RUT --> VAC
+    CMP & VAC & CAN & RUT --> AUTH & WEB & AUD
     FBA -.-> VAC & CRY & RIVER & META
-    AUTH & REC --> DB
+    AUTH & REC & CMP & VAC & CAN & RUT --> DB
     DB --> PG
     RIVER -.-> PG
     FE --> API
 ```
 
+### Reglas de dependencia vigentes
+
+- `vacancies` usa `companies.FindOrCreate` (nunca al revés); `candidates` y
+  `rutas` referencian vacantes por id validando organización.
+- Endpoints públicos (`/api/v1/public/*`): solo lectura de vacantes publicadas
+  y `POST /applications` con rate limit estricto (10/min por IP); jamás
+  exponen datos org-internos.
+
 Endpoints vivos (todos verificados con tests + navegador real):
-`POST /auth/login` · `POST /auth/refresh` · `POST /auth/logout` · `GET /auth/me` ·
-`POST /auth/change-password` · `GET|POST /recruiters` · `PATCH /recruiters/{id}` ·
+`POST /auth/login|refresh|logout|change-password` · `GET /auth/me` ·
+`GET|POST /recruiters` · `PATCH /recruiters/{id}` ·
+`GET|POST /companies` · `PATCH /companies/{id}` ·
+`GET|POST /vacancies` · `GET|PATCH /vacancies/{id}` ·
+`GET /candidates` · `GET /applications` · `PATCH /applications/{id}` ·
+`GET|POST /rutas` · `PATCH|DELETE /rutas/{id}` ·
+`GET /public/vacancies` · `GET /public/vacancies/{id}` · `POST /public/applications` ·
 `GET /healthz` · `GET /readyz`
 
 ### Reglas de dependencia (se validan al revisar el grafo)

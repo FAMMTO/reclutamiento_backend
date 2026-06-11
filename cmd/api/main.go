@@ -16,11 +16,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/FAMMTO/reclutamiento_backend/internal/auth"
+	"github.com/FAMMTO/reclutamiento_backend/internal/candidates"
+	"github.com/FAMMTO/reclutamiento_backend/internal/companies"
 	"github.com/FAMMTO/reclutamiento_backend/internal/platform/audit"
 	"github.com/FAMMTO/reclutamiento_backend/internal/platform/config"
 	"github.com/FAMMTO/reclutamiento_backend/internal/platform/db"
 	"github.com/FAMMTO/reclutamiento_backend/internal/platform/httpserver"
 	"github.com/FAMMTO/reclutamiento_backend/internal/recruiters"
+	"github.com/FAMMTO/reclutamiento_backend/internal/rutas"
+	"github.com/FAMMTO/reclutamiento_backend/internal/vacancies"
 )
 
 func main() {
@@ -59,6 +63,10 @@ func run(log *slog.Logger) error {
 	authService := auth.NewService(pool, auditLog, cfg.JWTSecret, cfg.AccessTokenTTL, cfg.RefreshTokenTTL)
 	authHandlers := auth.NewHandlers(authService, cfg.CookieSecure, cfg.CookieDomain, cfg.RefreshTokenTTL)
 	recruiterHandlers := recruiters.NewHandlers(recruiters.NewService(pool, auditLog))
+	companyHandlers := companies.NewHandlers(companies.NewService(pool, auditLog))
+	vacancyHandlers := vacancies.NewHandlers(vacancies.NewService(pool, auditLog))
+	rutaHandlers := rutas.NewHandlers(rutas.NewService(pool, auditLog))
+	candidateHandlers := candidates.NewHandlers(candidates.NewService(pool, auditLog))
 
 	router := chi.NewRouter()
 	router.Use(httpserver.Recover(log))
@@ -101,15 +109,48 @@ func run(log *slog.Logger) error {
 			})
 		})
 
+		// endpoints públicos del flujo de candidatos (sin auth, rate limit propio)
+		api.Route("/public", func(public chi.Router) {
+			public.Group(func(reads chi.Router) {
+				reads.Use(httpserver.RateLimit(120, 40))
+				reads.Get("/vacancies", vacancyHandlers.PublicList)
+				reads.Get("/vacancies/{id}", vacancyHandlers.PublicGet)
+			})
+			public.Group(func(writes chi.Router) {
+				writes.Use(httpserver.RateLimit(10, 5)) // anti-spam de postulaciones
+				writes.Post("/applications", candidateHandlers.Apply)
+			})
+		})
+
 		api.Group(func(protected chi.Router) {
 			protected.Use(auth.RequireAuth(cfg.JWTSecret))
 			protected.Use(auth.RequirePasswordChanged)
 
+			// todos los roles
+			protected.Post("/vacancies", vacancyHandlers.Create)
+			protected.Get("/vacancies", vacancyHandlers.List)
+			protected.Get("/vacancies/{id}", vacancyHandlers.Get)
+			protected.Patch("/vacancies/{id}", vacancyHandlers.SetStatus)
+
+			protected.Get("/candidates", candidateHandlers.ListCandidates)
+			protected.Get("/applications", candidateHandlers.ListApplications)
+			protected.Patch("/applications/{id}", candidateHandlers.SetApplicationStatus)
+
+			protected.Get("/rutas", rutaHandlers.List)
+			protected.Post("/rutas", rutaHandlers.Create)
+			protected.Patch("/rutas/{id}", rutaHandlers.Update)
+			protected.Delete("/rutas/{id}", rutaHandlers.Delete)
+
+			// solo Administrador (matriz de permisos)
 			protected.Group(func(admin chi.Router) {
 				admin.Use(auth.RequireAdmin)
 				admin.Get("/recruiters", recruiterHandlers.List)
 				admin.Post("/recruiters", recruiterHandlers.Create)
 				admin.Patch("/recruiters/{id}", recruiterHandlers.SetActive)
+
+				admin.Get("/companies", companyHandlers.List)
+				admin.Post("/companies", companyHandlers.Create)
+				admin.Patch("/companies/{id}", companyHandlers.Rename)
 			})
 		})
 	})

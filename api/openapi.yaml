@@ -17,6 +17,11 @@ servers:
 tags:
   - name: auth
   - name: recruiters
+  - name: companies
+  - name: vacancies
+  - name: candidates
+  - name: rutas
+  - name: public
   - name: ops
 
 paths:
@@ -222,6 +227,214 @@ paths:
         "400": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
 
+  /api/v1/companies:
+    get:
+      tags: [companies]
+      summary: Listar compañías con conteo de vacantes (solo Administrador)
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: ok }
+    post:
+      tags: [companies]
+      summary: Crear compañía (solo Administrador)
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 2, maxLength: 120 }
+      responses:
+        "201": { description: creada }
+        "409": { description: nombre duplicado (`name_taken`) }
+
+  /api/v1/companies/{id}:
+    patch:
+      tags: [companies]
+      summary: Renombrar compañía (solo Administrador)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: ok }
+
+  /api/v1/vacancies:
+    get:
+      tags: [vacancies]
+      summary: Listar vacantes de la organización (filtros y paginación server-side)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [draft, published, closed] } }
+        - { name: search, in: query, schema: { type: string } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, default: 20, maximum: 100 } }
+      responses:
+        "200":
+          description: "{ vacancies: Vacancy[], total: int }"
+    post:
+      tags: [vacancies]
+      summary: Crear vacante (borrador o publicada)
+      description: >
+        `company` por nombre hace find-or-create en la organización. Con
+        `publish: true` nace en estado `published` con `publishedAt`.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateVacancyInput" }
+      responses:
+        "201":
+          description: Creada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  vacancy: { $ref: "#/components/schemas/Vacancy" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /api/v1/vacancies/{id}:
+    get:
+      tags: [vacancies]
+      summary: Obtener vacante de la organización
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: ok }
+        "404": { $ref: "#/components/responses/Error" }
+    patch:
+      tags: [vacancies]
+      summary: Cambiar estado (ciclo draft→published→closed; closed→published reabre)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [draft, published, closed] }
+      responses:
+        "200": { description: ok }
+        "400": { description: transición inválida (`bad_status`) }
+
+  /api/v1/public/vacancies:
+    get:
+      tags: [public]
+      summary: Vacantes publicadas (portal del candidato, sin auth)
+      responses:
+        "200": { description: "{ vacancies: Vacancy[] } — máx. 100, orden por publishedAt" }
+
+  /api/v1/public/vacancies/{id}:
+    get:
+      tags: [public]
+      summary: Vacante publicada por id (sin auth)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: ok }
+        "404": { description: no existe o no está publicada }
+
+  /api/v1/public/applications:
+    post:
+      tags: [public]
+      summary: Postulación pública a una vacante (sin auth, rate limit 10/min por IP)
+      description: >
+        Upsert del candidato por (organización, teléfono): la postulación más
+        reciente actualiza el perfil. Una postulación por candidato por vacante.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ApplyInput" }
+      responses:
+        "201": { description: "{ applicationId: uuid }" }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { description: vacante no disponible (`vacancy_not_open`) }
+        "409": { description: ya postulado (`already_applied`) }
+
+  /api/v1/candidates:
+    get:
+      tags: [candidates]
+      summary: Listar candidatos de la organización (búsqueda y paginación)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: search, in: query, schema: { type: string } }
+        - { name: page, in: query, schema: { type: integer } }
+      responses:
+        "200": { description: "{ candidates: Candidate[], total: int }" }
+
+  /api/v1/applications:
+    get:
+      tags: [candidates]
+      summary: Listar postulaciones (opcionalmente por vacante)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: vacancyId, in: query, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: "{ applications: Application[] }" }
+
+  /api/v1/applications/{id}:
+    patch:
+      tags: [candidates]
+      summary: Cambiar estado de la postulación (pipeline)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [nueva, en_revision, entrevista, rechazada, contratada]
+      responses:
+        "200": { description: ok }
+
+  /api/v1/rutas:
+    get:
+      tags: [rutas]
+      summary: Listar rutas de transporte con sus vacantes vinculadas
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: "{ rutas: Ruta[] }" }
+    post:
+      tags: [rutas]
+      summary: Crear ruta (vacancyIds valida pertenencia a la organización)
+      security: [{ bearerAuth: [] }]
+      responses:
+        "201": { description: creada }
+
+  /api/v1/rutas/{id}:
+    patch:
+      tags: [rutas]
+      summary: Actualizar ruta y sus vínculos
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: ok }
+    delete:
+      tags: [rutas]
+      summary: Eliminar ruta
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: ok }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -265,3 +478,68 @@ components:
       properties:
         accessToken: { type: string, description: "JWT Bearer, 15 minutos" }
         recruiter: { $ref: "#/components/schemas/Recruiter" }
+
+    Vacancy:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        companyId: { type: string, format: uuid }
+        company: { type: string }
+        surveyName: { type: string }
+        jobTitle: { type: string }
+        jobDescription: { type: string }
+        state: { type: string }
+        municipality: { type: string }
+        location: { type: string, description: "municipio, estado (derivado)" }
+        workMode: { type: string, enum: [Hibrida, Presencial, Remoto] }
+        salaryRange: { type: string }
+        schedule: { type: string }
+        requestedSex: { type: string, enum: [Hombre, Mujer, Ambos] }
+        educationLevel: { type: array, items: { type: string } }
+        activities: { type: array, items: { type: string } }
+        customBoxes: { type: array, items: { type: string } }
+        status: { type: string, enum: [draft, published, closed] }
+        publishedAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    CreateVacancyInput:
+      type: object
+      required: [surveyName, jobTitle, jobDescription, company, workMode, requestedSex, activities]
+      properties:
+        surveyName: { type: string, maxLength: 200 }
+        jobTitle: { type: string, maxLength: 200 }
+        jobDescription: { type: string }
+        company: { type: string, description: "find-or-create por nombre" }
+        state: { type: string }
+        municipality: { type: string }
+        workMode: { type: string, enum: [Hibrida, Presencial, Remoto] }
+        salaryRange: { type: string }
+        schedule: { type: string }
+        requestedSex: { type: string, enum: [Hombre, Mujer, Ambos] }
+        educationLevel: { type: array, items: { type: string } }
+        activities: { type: array, items: { type: string }, minItems: 1 }
+        customBoxes: { type: array, items: { type: string } }
+        publish: { type: boolean, default: false }
+
+    ApplyInput:
+      type: object
+      required: [vacancyId, phone, name, education]
+      properties:
+        vacancyId: { type: string, format: uuid }
+        phone: { type: string, pattern: "^[0-9+ ]{7,20}$" }
+        name: { type: string, description: "solo letras y espacios" }
+        age: { type: integer, minimum: 14, maximum: 99 }
+        email: { type: string, format: email }
+        state: { type: string }
+        municipality: { type: string }
+        education: { type: string }
+        degree: { type: string }
+        desiredSalary: { type: string }
+        answers:
+          type: array
+          maxItems: 50
+          items:
+            type: object
+            properties:
+              question: { type: string }
+              answer: { type: string, maxLength: 4000 }

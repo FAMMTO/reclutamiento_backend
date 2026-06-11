@@ -5,6 +5,8 @@ package facebookads
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -94,15 +97,43 @@ var (
 // graphBaseURL puede ser sobreescrito en tests.
 var graphBaseURL = "https://graph.facebook.com"
 
-// ── Servicio ──────────────────────────────────────────────────────────────────
+// ── Tipos de discovery ────────────────────────────────────────────────────────
 
-type Service struct {
-	pool *pgxpool.Pool
-	enc  *crypto.Encryptor
+type AdAccount struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Status int    `json:"status"`
 }
 
-func NewService(pool *pgxpool.Pool, enc *crypto.Encryptor) *Service {
-	return &Service{pool: pool, enc: enc}
+type FbPage struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// ── Servicio ──────────────────────────────────────────────────────────────────
+
+type oauthStateEntry struct {
+	orgID     uuid.UUID
+	expiresAt time.Time
+}
+
+type Service struct {
+	pool        *pgxpool.Pool
+	enc         *crypto.Encryptor
+	redirectURI string
+	frontendURL string
+	mu          sync.Mutex
+	oauthStates map[string]oauthStateEntry
+}
+
+func NewService(pool *pgxpool.Pool, enc *crypto.Encryptor, redirectURI, frontendURL string) *Service {
+	return &Service{
+		pool:        pool,
+		enc:         enc,
+		redirectURI: redirectURI,
+		frontendURL: frontendURL,
+		oauthStates: make(map[string]oauthStateEntry),
+	}
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -357,6 +388,247 @@ func (s *Service) DeleteAd(ctx context.Context, orgID, adID uuid.UUID) error {
 	return nil
 }
 
+// ── OAuth ─────────────────────────────────────────────────────────────────────
+
+// GenerateOAuthURL construye la URL de autorización de Meta y guarda el state
+// CSRF en memoria (expira en 10 minutos).
+func (s *Service) GenerateOAuthURL(ctx context.Context, orgID uuid.UUID) (string, error) {
+	var appID, apiVersion string
+	err := s.pool.QueryRow(ctx,
+		`SELECT app_id, api_version FROM facebook_ads_configs WHERE organization_id = $1`, orgID,
+	).Scan(&appID, &apiVersion)
+	if err != nil || appID == "" {
+		return "", errors.New("facebookads: configura el App ID antes de conectar")
+	}
+	if apiVersion == "" {
+		apiVersion = "v23.0"
+	}
+
+	state, err := randomHex(16)
+	if err != nil {
+		return "", fmt.Errorf("facebookads: generar state: %w", err)
+	}
+
+	s.mu.Lock()
+	s.oauthStates[state] = oauthStateEntry{orgID: orgID, expiresAt: time.Now().Add(10 * time.Minute)}
+	// limpiar estados expirados mientras tenemos el lock
+	for k, v := range s.oauthStates {
+		if time.Now().After(v.expiresAt) {
+			delete(s.oauthStates, k)
+		}
+	}
+	s.mu.Unlock()
+
+	params := url.Values{
+		"client_id":     {appID},
+		"redirect_uri":  {s.redirectURI},
+		"state":         {state},
+		"scope":         {"ads_management,pages_manage_ads,ads_read,pages_read_engagement"},
+		"response_type": {"code"},
+	}
+	return fmt.Sprintf("https://www.facebook.com/%s/dialog/oauth?%s", apiVersion, params.Encode()), nil
+}
+
+// HandleCallback procesa el callback de Meta: valida el state, intercambia el
+// código por un long-lived token (60 días) y lo guarda cifrado en DB.
+func (s *Service) HandleCallback(ctx context.Context, code, state string) error {
+	s.mu.Lock()
+	entry, ok := s.oauthStates[state]
+	if ok {
+		delete(s.oauthStates, state)
+	}
+	s.mu.Unlock()
+
+	if !ok || time.Now().After(entry.expiresAt) {
+		return errors.New("facebookads: state inválido o expirado (CSRF)")
+	}
+	orgID := entry.orgID
+
+	var appID, appSecretEnc, apiVersion string
+	err := s.pool.QueryRow(ctx,
+		`SELECT app_id, app_secret_enc, api_version FROM facebook_ads_configs WHERE organization_id = $1`,
+		orgID,
+	).Scan(&appID, &appSecretEnc, &apiVersion)
+	if err != nil {
+		return fmt.Errorf("facebookads: leer config: %w", err)
+	}
+	if appSecretEnc == "" {
+		return errors.New("facebookads: App Secret no configurado")
+	}
+
+	appSecretBytes, err := s.enc.Decrypt(appSecretEnc)
+	if err != nil {
+		return fmt.Errorf("facebookads: descifrar App Secret: %w", err)
+	}
+	appSecret := string(appSecretBytes)
+
+	// code → short-lived token
+	shortToken, err := s.exchangeCode(ctx, appID, appSecret, apiVersion, code)
+	if err != nil {
+		return err
+	}
+
+	// short-lived → long-lived (60 días)
+	longToken, err := s.exchangeForLongLived(ctx, appID, appSecret, apiVersion, shortToken)
+	if err != nil {
+		longToken = shortToken // fallback al token corto
+	}
+
+	tokenEnc, err := s.enc.Encrypt([]byte(longToken))
+	if err != nil {
+		return fmt.Errorf("facebookads: cifrar token: %w", err)
+	}
+
+	_, err = s.pool.Exec(ctx, `
+		UPDATE facebook_ads_configs
+		SET access_token_enc=$1, is_connected=true, connected_at=now(), updated_at=now()
+		WHERE organization_id=$2`, tokenEnc, orgID)
+	return err
+}
+
+// exchangeCode intercambia el authorization code por un short-lived access token.
+func (s *Service) exchangeCode(ctx context.Context, appID, appSecret, apiVersion, code string) (string, error) {
+	params := url.Values{
+		"client_id":     {appID},
+		"client_secret": {appSecret},
+		"redirect_uri":  {s.redirectURI},
+		"code":          {code},
+	}
+	endpoint := fmt.Sprintf("%s/%s/oauth/access_token?%s", graphBaseURL, apiVersion, params.Encode())
+	body, err := httpGet(ctx, endpoint)
+	if err != nil {
+		return "", fmt.Errorf("facebookads: intercambiar código: %w", err)
+	}
+	var resp struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil || resp.AccessToken == "" {
+		return "", errors.New("facebookads: respuesta de token inválida")
+	}
+	return resp.AccessToken, nil
+}
+
+// exchangeForLongLived intercambia un short-lived token por uno de larga duración.
+func (s *Service) exchangeForLongLived(ctx context.Context, appID, appSecret, apiVersion, shortToken string) (string, error) {
+	params := url.Values{
+		"grant_type":        {"fb_exchange_token"},
+		"client_id":         {appID},
+		"client_secret":     {appSecret},
+		"fb_exchange_token": {shortToken},
+	}
+	endpoint := fmt.Sprintf("%s/%s/oauth/access_token?%s", graphBaseURL, apiVersion, params.Encode())
+	body, err := httpGet(ctx, endpoint)
+	if err != nil {
+		return "", fmt.Errorf("facebookads: token largo: %w", err)
+	}
+	var resp struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil || resp.AccessToken == "" {
+		return "", errors.New("facebookads: token largo inválido")
+	}
+	return resp.AccessToken, nil
+}
+
+// ── Discovery ─────────────────────────────────────────────────────────────────
+
+// ListAdAccounts devuelve las cuentas publicitarias accesibles con el token guardado.
+func (s *Service) ListAdAccounts(ctx context.Context, orgID uuid.UUID) ([]AdAccount, error) {
+	accessToken, _, apiVersion, err := s.loadCredentials(ctx, orgID)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := fmt.Sprintf("%s/%s/me/adaccounts?fields=id,name,account_status&access_token=%s",
+		graphBaseURL, apiVersion, url.QueryEscape(accessToken))
+	body, err := httpGet(ctx, endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("facebookads: listar cuentas: %w", err)
+	}
+	var resp struct {
+		Data []struct {
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			Status int    `json:"account_status"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("facebookads: parsear cuentas: %w", err)
+	}
+	accounts := make([]AdAccount, len(resp.Data))
+	for i, a := range resp.Data {
+		accounts[i] = AdAccount{ID: a.ID, Name: a.Name, Status: a.Status}
+	}
+	return accounts, nil
+}
+
+// ListPages devuelve las páginas de Facebook accesibles con el token guardado.
+func (s *Service) ListPages(ctx context.Context, orgID uuid.UUID) ([]FbPage, error) {
+	accessToken, _, apiVersion, err := s.loadCredentials(ctx, orgID)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := fmt.Sprintf("%s/%s/me/accounts?fields=id,name&access_token=%s",
+		graphBaseURL, apiVersion, url.QueryEscape(accessToken))
+	body, err := httpGet(ctx, endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("facebookads: listar páginas: %w", err)
+	}
+	var resp struct {
+		Data []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("facebookads: parsear páginas: %w", err)
+	}
+	pages := make([]FbPage, len(resp.Data))
+	for i, p := range resp.Data {
+		pages[i] = FbPage{ID: p.ID, Name: p.Name}
+	}
+	return pages, nil
+}
+
+// SetSelection guarda la cuenta publicitaria y página seleccionadas sin resetear
+// is_connected (la conexión OAuth sigue válida).
+func (s *Service) SetSelection(ctx context.Context, orgID uuid.UUID, adAccountID, pageID string) (*Config, error) {
+	var cfg Config
+	cfg.OrganizationID = orgID
+	var appSecretEnc, accessTokenEnc string
+	err := s.pool.QueryRow(ctx, `
+		UPDATE facebook_ads_configs
+		SET ad_account_id=$1, page_id=$2, updated_at=now()
+		WHERE organization_id=$3
+		RETURNING id, app_id, app_secret_enc, access_token_enc,
+		          ad_account_id, page_id, business_id, api_version,
+		          is_connected, connected_at, updated_at`,
+		adAccountID, pageID, orgID,
+	).Scan(
+		&cfg.ID, &cfg.AppID, &appSecretEnc, &accessTokenEnc,
+		&cfg.AdAccountID, &cfg.PageID, &cfg.BusinessID, &cfg.APIVersion,
+		&cfg.IsConnected, &cfg.ConnectedAt, &cfg.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrConfigNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("facebookads: guardar selección: %w", err)
+	}
+	cfg.AppSecretSet = appSecretEnc != ""
+	cfg.AccessTokenSet = accessTokenEnc != ""
+	return &cfg, nil
+}
+
+// Disconnect borra el access token y resetea el estado de conexión.
+func (s *Service) Disconnect(ctx context.Context, orgID uuid.UUID) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE facebook_ads_configs
+		SET access_token_enc='', is_connected=false, connected_at=null,
+		    ad_account_id='', page_id='', updated_at=now()
+		WHERE organization_id=$1`, orgID)
+	return err
+}
+
 // ── Helpers internos ──────────────────────────────────────────────────────────
 
 func (s *Service) loadCredentials(ctx context.Context, orgID uuid.UUID) (accessToken, adAccountID, apiVersion string, err error) {
@@ -563,6 +835,14 @@ func (g *graphClient) createAd(ctx context.Context, name, adSetID, creativeID st
 }
 
 // ── Utilidades ────────────────────────────────────────────────────────────────
+
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
 
 func normalizeAccountID(id string) string {
 	id = strings.TrimSpace(id)

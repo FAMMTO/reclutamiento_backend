@@ -74,7 +74,8 @@ func run(log *slog.Logger) error {
 	vacancyHandlers := vacancies.NewHandlers(vacancies.NewService(pool, auditLog))
 	rutaHandlers := rutas.NewHandlers(rutas.NewService(pool, auditLog))
 	candidateHandlers := candidates.NewHandlers(candidates.NewService(pool, auditLog))
-	fbHandlers := facebookads.NewHandlers(facebookads.NewService(pool, enc))
+	fbSvc := facebookads.NewService(pool, enc, cfg.FacebookRedirectURI, cfg.FacebookFrontendURL)
+	fbHandlers := facebookads.NewHandlers(fbSvc, cfg.FacebookFrontendURL)
 
 	router := chi.NewRouter()
 	router.Use(httpserver.Recover(log))
@@ -117,6 +118,9 @@ func run(log *slog.Logger) error {
 			})
 		})
 
+		// callback OAuth de Meta — público (el browser llega aquí tras autorizar)
+		api.Get("/facebookads/oauth/callback", fbHandlers.OAuthCallback)
+
 		// endpoints públicos del flujo de candidatos (sin auth, rate limit propio)
 		api.Route("/public", func(public chi.Router) {
 			public.Group(func(reads chi.Router) {
@@ -153,6 +157,11 @@ func run(log *slog.Logger) error {
 			protected.Get("/facebookads/config", fbHandlers.GetConfig)
 			protected.Put("/facebookads/config", fbHandlers.SaveConfig)
 			protected.Post("/facebookads/test", fbHandlers.TestConnection)
+			protected.Get("/facebookads/oauth/url", fbHandlers.OAuthURL)
+			protected.Get("/facebookads/accounts", fbHandlers.ListAccounts)
+			protected.Get("/facebookads/pages", fbHandlers.ListPages)
+			protected.Put("/facebookads/selection", fbHandlers.SetSelection)
+			protected.Post("/facebookads/disconnect", fbHandlers.Disconnect)
 			protected.Get("/facebookads/ads", fbHandlers.ListAds)
 			protected.Post("/facebookads/ads", fbHandlers.CreateAd)
 			protected.Patch("/facebookads/ads/{id}", fbHandlers.SetAdStatus)

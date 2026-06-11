@@ -28,6 +28,10 @@ type Config struct {
 	// Cifrado en reposo (AES-256-GCM para secretos de terceros en Postgres)
 	EncryptionKey []byte
 
+	// Facebook OAuth
+	FacebookRedirectURI string // URL del callback registrada en Meta Developer Portal
+	FacebookFrontendURL string // A dónde redirigir al browser tras el callback
+
 	// Seed del primer administrador (solo se aplica si no existe ninguno)
 	SeedAdminName     string
 	SeedAdminEmail    string
@@ -66,6 +70,13 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("JWT_SECRET debe tener al menos 32 caracteres (tiene %d)", len(secret))
 	}
 	cfg.JWTSecret = []byte(secret)
+
+	cfg.FacebookRedirectURI = getenv("FACEBOOK_REDIRECT_URI", "http://localhost:4000/api/v1/facebookads/oauth/callback")
+	if len(cfg.CORSOrigins) > 0 {
+		cfg.FacebookFrontendURL = getenv("FACEBOOK_FRONTEND_URL", cfg.CORSOrigins[0])
+	} else {
+		cfg.FacebookFrontendURL = getenv("FACEBOOK_FRONTEND_URL", "http://localhost:8080")
+	}
 
 	encKey := os.Getenv("ENCRYPTION_KEY")
 	if len(encKey) != 32 {

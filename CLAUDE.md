@@ -39,7 +39,7 @@ graph TD
         VAC["✅ vacancies (ciclo draft→published→closed,<br/>filtros/paginación, vista pública)"]
         CAN["✅ candidates (upsert por org+teléfono,<br/>postulación pública, pipeline de estados)"]
         RUT["✅ rutas (CRUD + N:M ruta_vacancies)"]
-        FBA["✅ facebookads (config AES-GCM, Graph API<br/>server-side: campaign→adset→creative→ad)"]
+        FBA["✅ facebookads (OAuth PKCE + AES-GCM,<br/>discovery cuentas/páginas,<br/>Graph API: campaign→adset→creative→ad)"]
     end
 
     subgraph "internal/platform"
@@ -89,6 +89,9 @@ Endpoints vivos:
 `GET|POST /rutas` · `PATCH|DELETE /rutas/{id}` ·
 `GET /public/vacancies` · `GET /public/vacancies/{id}` · `POST /public/applications` ·
 `GET|PUT /facebookads/config` · `POST /facebookads/test` ·
+`GET /facebookads/oauth/url` · `GET /facebookads/oauth/callback` (público) ·
+`GET /facebookads/accounts` · `GET /facebookads/pages` ·
+`PUT /facebookads/selection` · `POST /facebookads/disconnect` ·
 `GET|POST /facebookads/ads` · `PATCH|DELETE /facebookads/ads/{id}` ·
 `GET /healthz` · `GET /readyz`
 

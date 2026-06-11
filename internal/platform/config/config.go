@@ -25,6 +25,9 @@ type Config struct {
 	CookieSecure    bool
 	CookieDomain    string
 
+	// Cifrado en reposo (AES-256-GCM para secretos de terceros en Postgres)
+	EncryptionKey []byte
+
 	// Seed del primer administrador (solo se aplica si no existe ninguno)
 	SeedAdminName     string
 	SeedAdminEmail    string
@@ -63,6 +66,12 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("JWT_SECRET debe tener al menos 32 caracteres (tiene %d)", len(secret))
 	}
 	cfg.JWTSecret = []byte(secret)
+
+	encKey := os.Getenv("ENCRYPTION_KEY")
+	if len(encKey) != 32 {
+		return nil, fmt.Errorf("ENCRYPTION_KEY debe tener exactamente 32 caracteres (tiene %d)", len(encKey))
+	}
+	cfg.EncryptionKey = []byte(encKey)
 
 	if cfg.Env == "production" {
 		if !cfg.CookieSecure {

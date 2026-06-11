@@ -18,8 +18,10 @@ import (
 	"github.com/FAMMTO/reclutamiento_backend/internal/auth"
 	"github.com/FAMMTO/reclutamiento_backend/internal/candidates"
 	"github.com/FAMMTO/reclutamiento_backend/internal/companies"
+	"github.com/FAMMTO/reclutamiento_backend/internal/facebookads"
 	"github.com/FAMMTO/reclutamiento_backend/internal/platform/audit"
 	"github.com/FAMMTO/reclutamiento_backend/internal/platform/config"
+	"github.com/FAMMTO/reclutamiento_backend/internal/platform/crypto"
 	"github.com/FAMMTO/reclutamiento_backend/internal/platform/db"
 	"github.com/FAMMTO/reclutamiento_backend/internal/platform/httpserver"
 	"github.com/FAMMTO/reclutamiento_backend/internal/recruiters"
@@ -59,6 +61,11 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
+	enc, err := crypto.New(cfg.EncryptionKey)
+	if err != nil {
+		return err
+	}
+
 	auditLog := audit.New(pool, log)
 	authService := auth.NewService(pool, auditLog, cfg.JWTSecret, cfg.AccessTokenTTL, cfg.RefreshTokenTTL)
 	authHandlers := auth.NewHandlers(authService, cfg.CookieSecure, cfg.CookieDomain, cfg.RefreshTokenTTL)
@@ -67,6 +74,7 @@ func run(log *slog.Logger) error {
 	vacancyHandlers := vacancies.NewHandlers(vacancies.NewService(pool, auditLog))
 	rutaHandlers := rutas.NewHandlers(rutas.NewService(pool, auditLog))
 	candidateHandlers := candidates.NewHandlers(candidates.NewService(pool, auditLog))
+	fbHandlers := facebookads.NewHandlers(facebookads.NewService(pool, enc))
 
 	router := chi.NewRouter()
 	router.Use(httpserver.Recover(log))
@@ -140,6 +148,15 @@ func run(log *slog.Logger) error {
 			protected.Post("/rutas", rutaHandlers.Create)
 			protected.Patch("/rutas/{id}", rutaHandlers.Update)
 			protected.Delete("/rutas/{id}", rutaHandlers.Delete)
+
+			// Facebook Ads (todos los roles autenticados)
+			protected.Get("/facebookads/config", fbHandlers.GetConfig)
+			protected.Put("/facebookads/config", fbHandlers.SaveConfig)
+			protected.Post("/facebookads/test", fbHandlers.TestConnection)
+			protected.Get("/facebookads/ads", fbHandlers.ListAds)
+			protected.Post("/facebookads/ads", fbHandlers.CreateAd)
+			protected.Patch("/facebookads/ads/{id}", fbHandlers.SetAdStatus)
+			protected.Delete("/facebookads/ads/{id}", fbHandlers.DeleteAd)
 
 			// solo Administrador (matriz de permisos)
 			protected.Group(func(admin chi.Router) {

@@ -19,9 +19,9 @@ Plan maestro: `../PLAN_DE_ACCION.md` (arquitectura, esquema de DB, fases y crite
 
 ## Grafo del proyecto
 
-> Última actualización: 2026-06-10 — Fases 1, 2 y 3 implementadas y verificadas
-> end-to-end (auth, reclutadores, compañías, vacantes, rutas, candidatos y
-> postulaciones). Lo ⬜ es lo que falta (PLAN_DE_ACCION.md) y se marca ✅ al construirse.
+> Última actualización: 2026-06-11 — Fases 1-4 implementadas: auth, reclutadores,
+> compañías, vacantes, rutas, candidatos, postulaciones y Facebook Ads server-side
+> (AES-GCM, Graph API desde el backend). Lo ⬜ es lo que falta y se marca ✅ al construirse.
 
 Estado de nodos: ⬜ planeado · ✅ implementado
 
@@ -39,7 +39,7 @@ graph TD
         VAC["✅ vacancies (ciclo draft→published→closed,<br/>filtros/paginación, vista pública)"]
         CAN["✅ candidates (upsert por org+teléfono,<br/>postulación pública, pipeline de estados)"]
         RUT["✅ rutas (CRUD + N:M ruta_vacancies)"]
-        FBA["⬜ facebookads (Graph API server-side)"]
+        FBA["✅ facebookads (config AES-GCM, Graph API<br/>server-side: campaign→adset→creative→ad)"]
     end
 
     subgraph "internal/platform"
@@ -48,10 +48,10 @@ graph TD
         HTTPS["✅ httpserver (CORS lista blanca,<br/>rate limit por IP, headers, logging, recover)"]
         WEB["✅ web (JSON envelope de error,<br/>decode seguro 1MiB)"]
         AUD["✅ audit (bitácora audit_log)"]
-        CRY["⬜ crypto (AES-GCM secretos Meta)"]
+        CRY["✅ crypto (AES-256-GCM, ENCRYPTION_KEY 32B)"]
     end
 
-    PG[("✅ PostgreSQL 16<br/>0001: organizations, recruiters, refresh_tokens, audit_log<br/>0002: companies, vacancies, rutas, ruta_vacancies<br/>0003: candidates, applications")]
+    PG[("✅ PostgreSQL 16<br/>0001: organizations, recruiters, refresh_tokens, audit_log<br/>0002: companies, vacancies, rutas, ruta_vacancies<br/>0003: candidates, applications<br/>0004: facebook_ads_configs, facebook_ad_drafts")]
     RIVER["⬜ river (cola de jobs en Postgres)"]
     META["Meta Graph API"]
     FE["✅ Frontend RECLUTAMIENTO-AI<br/>(src/lib/api/* consume este API;<br/>contrato: api/openapi.yaml)"]
@@ -80,7 +80,7 @@ graph TD
   y `POST /applications` con rate limit estricto (10/min por IP); jamás
   exponen datos org-internos.
 
-Endpoints vivos (todos verificados con tests + navegador real):
+Endpoints vivos:
 `POST /auth/login|refresh|logout|change-password` · `GET /auth/me` ·
 `GET|POST /recruiters` · `PATCH /recruiters/{id}` ·
 `GET|POST /companies` · `PATCH /companies/{id}` ·
@@ -88,6 +88,8 @@ Endpoints vivos (todos verificados con tests + navegador real):
 `GET /candidates` · `GET /applications` · `PATCH /applications/{id}` ·
 `GET|POST /rutas` · `PATCH|DELETE /rutas/{id}` ·
 `GET /public/vacancies` · `GET /public/vacancies/{id}` · `POST /public/applications` ·
+`GET|PUT /facebookads/config` · `POST /facebookads/test` ·
+`GET|POST /facebookads/ads` · `PATCH|DELETE /facebookads/ads/{id}` ·
 `GET /healthz` · `GET /readyz`
 
 ### Reglas de dependencia (se validan al revisar el grafo)

@@ -1,0 +1,22 @@
+[Unit]
+Description=Jobbly API — servidor HTTP Go
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=jobbly
+Group=jobbly
+WorkingDirectory=/opt/jobbly
+ExecStart=/opt/jobbly/jobbly-api
+EnvironmentFile=/opt/jobbly/.env
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+# Seguridad mínima
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

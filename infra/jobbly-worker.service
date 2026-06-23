@@ -1,0 +1,21 @@
+[Unit]
+Description=Jobbly Worker — procesador de jobs River
+After=network.target postgresql.service jobbly-api.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=jobbly
+Group=jobbly
+WorkingDirectory=/opt/jobbly
+ExecStart=/opt/jobbly/jobbly-worker
+EnvironmentFile=/opt/jobbly/.env
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=65536
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

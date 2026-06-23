@@ -21,6 +21,7 @@ var (
 	ErrInvalidRefresh     = errors.New("sesión inválida o expirada")
 	ErrWeakPassword       = errors.New("contraseña débil")
 	ErrSamePassword       = errors.New("la nueva contraseña debe ser distinta a la actual")
+	ErrTokenInvalid       = errors.New("token inválido o expirado")
 )
 
 type Recruiter struct {
@@ -194,6 +195,102 @@ func (s *Service) GetRecruiter(ctx context.Context, id uuid.UUID) (Recruiter, er
 		   FROM recruiters WHERE id = $1 AND is_active = true`, id)
 	rec, _, err := scanRecruiter(row)
 	return rec, err
+}
+
+// ForgotPassword genera un token de un solo uso (30 min) para restablecer la
+// contraseña. Siempre devuelve nil como error al caller para evitar enumeración
+// de emails; si el email no existe simplemente devuelve cadenas vacías.
+func (s *Service) ForgotPassword(ctx context.Context, email string) (token, recruiterEmail, recruiterName string, err error) {
+	email = strings.TrimSpace(strings.ToLower(email))
+
+	var recruiterID uuid.UUID
+	var name string
+	scanErr := s.pool.QueryRow(ctx,
+		`SELECT id, name FROM recruiters WHERE email = $1 AND is_active = true`, email,
+	).Scan(&recruiterID, &name)
+	if scanErr != nil {
+		if errors.Is(scanErr, pgx.ErrNoRows) {
+			return "", "", "", nil // anti-enumeración
+		}
+		return "", "", "", scanErr
+	}
+
+	rawToken, tokenHash, genErr := NewRefreshToken() // 32 bytes aleatorios, mismo mecanismo
+	if genErr != nil {
+		return "", "", "", genErr
+	}
+
+	// invalidar tokens pendientes anteriores del mismo reclutador
+	_, _ = s.pool.Exec(ctx,
+		`DELETE FROM password_reset_tokens WHERE recruiter_id = $1 AND used_at IS NULL`, recruiterID)
+
+	if _, err = s.pool.Exec(ctx,
+		`INSERT INTO password_reset_tokens (recruiter_id, token_hash, expires_at)
+		 VALUES ($1, $2, $3)`,
+		recruiterID, tokenHash, time.Now().Add(30*time.Minute)); err != nil {
+		return "", "", "", err
+	}
+
+	s.audit.Record(ctx, audit.Entry{ActorID: &recruiterID, Action: "auth.forgot_password",
+		Entity: "recruiter", EntityID: recruiterID.String(), Detail: map[string]any{"email": email}})
+
+	return rawToken, email, name, nil
+}
+
+// ResetPassword valida el token, aplica la nueva contraseña y revoca todas
+// las sesiones activas. El token queda marcado como usado (no reutilizable).
+func (s *Service) ResetPassword(ctx context.Context, rawToken, newPassword, ip string) error {
+	tokenHash := HashRefreshToken(rawToken)
+
+	var recruiterID uuid.UUID
+	var expiresAt time.Time
+	var usedAt *time.Time
+	err := s.pool.QueryRow(ctx,
+		`SELECT recruiter_id, expires_at, used_at FROM password_reset_tokens WHERE token_hash = $1`, tokenHash,
+	).Scan(&recruiterID, &expiresAt, &usedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrTokenInvalid
+		}
+		return err
+	}
+	if usedAt != nil || time.Now().After(expiresAt) {
+		return ErrTokenInvalid
+	}
+
+	if err := ValidateNewPassword(newPassword); err != nil {
+		return errors.Join(ErrWeakPassword, err)
+	}
+	newHash, err := HashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+
+	tx, txErr := s.pool.Begin(ctx)
+	if txErr != nil {
+		return txErr
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE password_reset_tokens SET used_at = now() WHERE token_hash = $1`, tokenHash); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE recruiters SET password_hash = $1, password_changed = true, updated_at = now() WHERE id = $2`,
+		newHash, recruiterID); err != nil {
+		return err
+	}
+	_, _ = tx.Exec(ctx,
+		`UPDATE refresh_tokens SET revoked_at = now() WHERE recruiter_id = $1 AND revoked_at IS NULL`,
+		recruiterID)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	s.audit.Record(ctx, audit.Entry{ActorID: &recruiterID, Action: "auth.reset_password",
+		Entity: "recruiter", EntityID: recruiterID.String(), IP: ip})
+	return nil
 }
 
 // ChangePassword valida la actual, aplica la política, marca password_changed

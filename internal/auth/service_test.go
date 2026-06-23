@@ -156,3 +156,115 @@ func TestChangePasswordFlow(t *testing.T) {
 		t.Fatalf("login con la nueva contraseña falló: %v", err)
 	}
 }
+
+func TestForgotPasswordAntiEnumeration(t *testing.T) {
+	service, pool := setupTestService(t)
+	ctx := context.Background()
+	createTestRecruiter(t, pool, "existe@test.mx", "Temporal123", true)
+
+	// email inexistente → sin error y sin token (anti-enumeración)
+	tok, email, name, err := service.ForgotPassword(ctx, "noexiste@test.mx")
+	if err != nil {
+		t.Fatalf("ForgotPassword con email inexistente no debe devolver error: %v", err)
+	}
+	if tok != "" || email != "" || name != "" {
+		t.Fatal("email inexistente no debe generar token ni datos")
+	}
+
+	// email existente → token válido
+	tok, email, name, err = service.ForgotPassword(ctx, "existe@test.mx")
+	if err != nil {
+		t.Fatalf("ForgotPassword con email existente falló: %v", err)
+	}
+	if tok == "" {
+		t.Fatal("se esperaba un token para email existente")
+	}
+	if email != "existe@test.mx" || name == "" {
+		t.Fatalf("datos incorrectos: email=%s name=%s", email, name)
+	}
+
+	// llamar de nuevo invalida el token anterior y emite uno nuevo
+	tok2, _, _, err := service.ForgotPassword(ctx, "existe@test.mx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok2 == tok {
+		t.Fatal("segundo ForgotPassword debería generar token distinto")
+	}
+
+	// el token anterior ya no debe estar en la DB
+	var count int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM password_reset_tokens WHERE used_at IS NULL`,
+	).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("debía haber solo 1 token activo tras llamada doble, hay %d", count)
+	}
+}
+
+func TestResetPasswordFlow(t *testing.T) {
+	service, pool := setupTestService(t)
+	ctx := context.Background()
+	createTestRecruiter(t, pool, "reset@test.mx", "Temporal123", true)
+
+	// generar sesión activa para verificar que se revoca al hacer reset
+	session, err := service.Login(ctx, "reset@test.mx", "Temporal123", "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalRefresh := session.RefreshToken
+
+	// obtener token de reset
+	rawToken, _, _, err := service.ForgotPassword(ctx, "reset@test.mx")
+	if err != nil || rawToken == "" {
+		t.Fatalf("ForgotPassword falló: %v", err)
+	}
+
+	// token inválido → error
+	if err := service.ResetPassword(ctx, "token-falso", "NuevaClave2026", "127.0.0.1"); !errors.Is(err, ErrTokenInvalid) {
+		t.Fatalf("token inválido: esperaba ErrTokenInvalid, fue %v", err)
+	}
+
+	// contraseña débil → error
+	if err := service.ResetPassword(ctx, rawToken, "corta1", "127.0.0.1"); !errors.Is(err, ErrWeakPassword) {
+		t.Fatalf("contraseña débil: esperaba ErrWeakPassword, fue %v", err)
+	}
+
+	// reset válido
+	if err := service.ResetPassword(ctx, rawToken, "NuevaClave2026!", "127.0.0.1"); err != nil {
+		t.Fatalf("reset válido falló: %v", err)
+	}
+
+	// token ya no reutilizable
+	if err := service.ResetPassword(ctx, rawToken, "OtraClave2026!", "127.0.0.1"); !errors.Is(err, ErrTokenInvalid) {
+		t.Fatalf("segundo uso del token: esperaba ErrTokenInvalid, fue %v", err)
+	}
+
+	// login con contraseña antigua falla
+	if _, err := service.Login(ctx, "reset@test.mx", "Temporal123", "127.0.0.1"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatal("la contraseña antigua debió quedar inválida")
+	}
+
+	// login con contraseña nueva funciona
+	if _, err := service.Login(ctx, "reset@test.mx", "NuevaClave2026!", "127.0.0.1"); err != nil {
+		t.Fatalf("login con nueva contraseña falló: %v", err)
+	}
+
+	// sesión anterior debe haber sido revocada
+	if _, err := service.Refresh(ctx, originalRefresh, "127.0.0.1"); !errors.Is(err, ErrInvalidRefresh) {
+		t.Fatal("las sesiones previas debieron revocarse al hacer reset")
+	}
+
+	// verificar passwordChanged = true en la DB
+	var pwChanged bool
+	if err := pool.QueryRow(ctx,
+		`SELECT password_changed FROM recruiters WHERE email = 'reset@test.mx'`,
+	).Scan(&pwChanged); err != nil {
+		t.Fatal(err)
+	}
+	if !pwChanged {
+		t.Fatal("passwordChanged debió quedar en true tras el reset")
+	}
+}

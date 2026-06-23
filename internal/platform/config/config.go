@@ -28,6 +28,11 @@ type Config struct {
 	// Cifrado en reposo (AES-256-GCM para secretos de terceros en Postgres)
 	EncryptionKey []byte
 
+	// Email transaccional (Resend)
+	ResendAPIKey    string // si vacío, los emails se omiten con log.Warn
+	ResendFromEmail string // ej. "Jobbly <no-reply@jobbly.mx>" o "onboarding@resend.dev" en dev
+	FrontendBaseURL string // base URL del frontend, para construir links en emails
+
 	// Facebook OAuth
 	FacebookRedirectURI string // URL del callback registrada en Meta Developer Portal
 	FacebookFrontendURL string // A dónde redirigir al browser tras el callback
@@ -48,6 +53,8 @@ func Load() (*Config, error) {
 		RefreshTokenTTL:   getDuration("REFRESH_TOKEN_TTL", 7*24*time.Hour),
 		CookieSecure:      getBool("COOKIE_SECURE", false),
 		CookieDomain:      os.Getenv("COOKIE_DOMAIN"),
+		ResendAPIKey:      os.Getenv("RESEND_API_KEY"),
+		ResendFromEmail:   getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev"),
 		SeedAdminName:     getenv("SEED_ADMIN_NAME", "Administrador Inicial"),
 		SeedAdminEmail:    os.Getenv("SEED_ADMIN_EMAIL"),
 		SeedAdminPassword: os.Getenv("SEED_ADMIN_PASSWORD"),
@@ -74,8 +81,10 @@ func Load() (*Config, error) {
 	cfg.FacebookRedirectURI = getenv("FACEBOOK_REDIRECT_URI", "http://localhost:4000/api/v1/facebookads/oauth/callback")
 	if len(cfg.CORSOrigins) > 0 {
 		cfg.FacebookFrontendURL = getenv("FACEBOOK_FRONTEND_URL", cfg.CORSOrigins[0])
+		cfg.FrontendBaseURL = getenv("FRONTEND_BASE_URL", cfg.CORSOrigins[0])
 	} else {
 		cfg.FacebookFrontendURL = getenv("FACEBOOK_FRONTEND_URL", "http://localhost:8080")
+		cfg.FrontendBaseURL = getenv("FRONTEND_BASE_URL", "http://localhost:8080")
 	}
 
 	encKey := os.Getenv("ENCRYPTION_KEY")

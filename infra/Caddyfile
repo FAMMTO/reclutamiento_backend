@@ -1,0 +1,20 @@
+api.jobbly.mx {
+    reverse_proxy localhost:4000 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+    }
+
+    # Compresión
+    encode gzip
+
+    # Logs en JSON
+    log {
+        output file /var/log/caddy/api.jobbly.mx.log
+        format json
+    }
+
+    # TLS automático (Let's Encrypt via ACME)
+    tls {
+        protocols tls1.2 tls1.3
+    }
+}

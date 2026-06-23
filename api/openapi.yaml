@@ -112,6 +112,63 @@ paths:
                   recruiter: { $ref: "#/components/schemas/Recruiter" }
         "401": { $ref: "#/components/responses/Error" }
 
+  /api/v1/auth/forgot-password:
+    post:
+      tags: [auth]
+      summary: Solicitar restablecimiento de contraseña
+      description: >
+        Rate limit estricto (10/5s por IP). Siempre responde 200 para no
+        revelar si el email existe (anti-enumeración). Si el reclutador
+        existe, se envía un email con un enlace de un solo uso válido 30 min.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        "200":
+          description: Solicitud procesada (independientemente de si el email existe).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { ok: { type: boolean } }
+        "400": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+
+  /api/v1/auth/reset-password:
+    post:
+      tags: [auth]
+      summary: Restablecer contraseña con token de un solo uso
+      description: >
+        Rate limit estricto (10/5s por IP). El token viene del enlace del
+        email (query param `token`). Solo válido 30 min y un único uso.
+        Al completar, todas las sesiones previas quedan revocadas.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, newPassword]
+              properties:
+                token: { type: string, description: "Token opaco recibido por email" }
+                newPassword: { type: string, minLength: 10 }
+      responses:
+        "200":
+          description: Contraseña restablecida. El usuario debe iniciar sesión.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { ok: { type: boolean } }
+        "400": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+
   /api/v1/auth/change-password:
     post:
       tags: [auth]

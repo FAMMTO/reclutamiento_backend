@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -12,19 +13,29 @@ import (
 
 const refreshCookieName = "jobbly_refresh"
 
+// EmailSender es la interfaz que usa auth para enviar correos. La implementación
+// real vive en internal/platform/email; puede ser nil en dev sin RESEND_API_KEY.
+type EmailSender interface {
+	SendPasswordReset(ctx context.Context, to, name, resetURL string) error
+}
+
 type Handlers struct {
 	service      *Service
 	cookieSecure bool
 	cookieDomain string
 	refreshTTL   time.Duration
+	emailSender  EmailSender // puede ser nil; en ese caso se omite el envío
+	frontendURL  string
 }
 
-func NewHandlers(service *Service, cookieSecure bool, cookieDomain string, refreshTTL time.Duration) *Handlers {
+func NewHandlers(service *Service, cookieSecure bool, cookieDomain string, refreshTTL time.Duration, emailSender EmailSender, frontendURL string) *Handlers {
 	return &Handlers{
 		service:      service,
 		cookieSecure: cookieSecure,
 		cookieDomain: cookieDomain,
 		refreshTTL:   refreshTTL,
+		emailSender:  emailSender,
+		frontendURL:  frontendURL,
 	}
 }
 
@@ -116,6 +127,60 @@ func (h *Handlers) Me(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	web.RespondJSON(w, http.StatusOK, map[string]Recruiter{"recruiter": recruiter})
+}
+
+// ForgotPassword maneja POST /api/v1/auth/forgot-password (público, rate limit estricto)
+// Siempre responde 200 para no revelar si el email existe.
+func (h *Handlers) ForgotPassword(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Email string `json:"email"`
+	}
+	if err := web.DecodeJSON(w, r, &body); err != nil {
+		web.RespondError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	body.Email = strings.TrimSpace(body.Email)
+	if body.Email == "" {
+		web.RespondError(w, http.StatusBadRequest, "bad_request", "El email es obligatorio")
+		return
+	}
+
+	token, email, name, err := h.service.ForgotPassword(r.Context(), body.Email)
+	if err == nil && token != "" && h.emailSender != nil {
+		resetURL := h.frontendURL + "/reset-password?token=" + token
+		_ = h.emailSender.SendPasswordReset(r.Context(), email, name, resetURL)
+	}
+	web.RespondJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// ResetPassword maneja POST /api/v1/auth/reset-password (público, rate limit estricto)
+func (h *Handlers) ResetPassword(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Token       string `json:"token"`
+		NewPassword string `json:"newPassword"`
+	}
+	if err := web.DecodeJSON(w, r, &body); err != nil {
+		web.RespondError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if body.Token == "" || body.NewPassword == "" {
+		web.RespondError(w, http.StatusBadRequest, "bad_request", "Token y nueva contraseña son obligatorios")
+		return
+	}
+
+	if err := h.service.ResetPassword(r.Context(), body.Token, body.NewPassword, httpserver.ClientIP(r)); err != nil {
+		switch {
+		case errors.Is(err, ErrTokenInvalid):
+			web.RespondError(w, http.StatusBadRequest, "token_invalid", "El enlace es inválido o ha expirado")
+		case errors.Is(err, ErrWeakPassword):
+			detail := strings.TrimPrefix(err.Error(), ErrWeakPassword.Error()+"\n")
+			web.RespondError(w, http.StatusBadRequest, "weak_password", detail)
+		default:
+			web.RespondError(w, http.StatusInternalServerError, "internal", "Error interno")
+		}
+		return
+	}
+	web.RespondJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // ChangePassword maneja POST /api/v1/auth/change-password (requiere RequireAuth)

@@ -19,11 +19,14 @@ import (
 	"github.com/FAMMTO/reclutamiento_backend/internal/candidates"
 	"github.com/FAMMTO/reclutamiento_backend/internal/companies"
 	"github.com/FAMMTO/reclutamiento_backend/internal/facebookads"
+	"github.com/FAMMTO/reclutamiento_backend/internal/jobs"
 	"github.com/FAMMTO/reclutamiento_backend/internal/platform/audit"
 	"github.com/FAMMTO/reclutamiento_backend/internal/platform/config"
 	"github.com/FAMMTO/reclutamiento_backend/internal/platform/crypto"
 	"github.com/FAMMTO/reclutamiento_backend/internal/platform/db"
+	"github.com/FAMMTO/reclutamiento_backend/internal/platform/email"
 	"github.com/FAMMTO/reclutamiento_backend/internal/platform/httpserver"
+	"github.com/FAMMTO/reclutamiento_backend/internal/platform/metrics"
 	"github.com/FAMMTO/reclutamiento_backend/internal/recruiters"
 	"github.com/FAMMTO/reclutamiento_backend/internal/rutas"
 	"github.com/FAMMTO/reclutamiento_backend/internal/vacancies"
@@ -68,13 +71,26 @@ func run(log *slog.Logger) error {
 
 	auditLog := audit.New(pool, log)
 	authService := auth.NewService(pool, auditLog, cfg.JWTSecret, cfg.AccessTokenTTL, cfg.RefreshTokenTTL)
-	authHandlers := auth.NewHandlers(authService, cfg.CookieSecure, cfg.CookieDomain, cfg.RefreshTokenTTL)
+
+	var emailSender auth.EmailSender
+	if cfg.ResendAPIKey != "" {
+		emailSender = email.New(cfg.ResendAPIKey, cfg.ResendFromEmail)
+	} else {
+		log.Warn("RESEND_API_KEY no configurado; los emails de restablecimiento de contraseña no se enviarán")
+	}
+
+	authHandlers := auth.NewHandlers(authService, cfg.CookieSecure, cfg.CookieDomain, cfg.RefreshTokenTTL, emailSender, cfg.FrontendBaseURL)
 	recruiterHandlers := recruiters.NewHandlers(recruiters.NewService(pool, auditLog))
 	companyHandlers := companies.NewHandlers(companies.NewService(pool, auditLog))
 	vacancyHandlers := vacancies.NewHandlers(vacancies.NewService(pool, auditLog))
 	rutaHandlers := rutas.NewHandlers(rutas.NewService(pool, auditLog))
 	candidateHandlers := candidates.NewHandlers(candidates.NewService(pool, auditLog))
 	fbSvc := facebookads.NewService(pool, enc, cfg.FacebookRedirectURI, cfg.FacebookFrontendURL)
+	if enqueuer, err := jobs.NewRiverEnqueuer(pool); err != nil {
+		log.Warn("no se pudo crear el enqueuer de River; publicación de anuncios usará goroutine fallback", "err", err)
+	} else {
+		fbSvc.SetEnqueuer(enqueuer)
+	}
 	fbHandlers := facebookads.NewHandlers(fbSvc, cfg.FacebookFrontendURL)
 
 	router := chi.NewRouter()
@@ -83,6 +99,12 @@ func run(log *slog.Logger) error {
 	router.Use(httpserver.SecurityHeaders)
 	router.Use(httpserver.CORS(cfg.CORSOrigins))
 	router.Use(httpserver.RateLimit(300, 60)) // límite global por IP
+	router.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			metrics.IncRequests()
+			next.ServeHTTP(w, r)
+		})
+	})
 
 	router.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -97,6 +119,9 @@ func run(log *slog.Logger) error {
 		_, _ = w.Write([]byte("ok"))
 	})
 
+	// /metrics solo accesible desde localhost (Caddy no hace proxy de esta ruta al exterior)
+	router.Get("/metrics", metrics.Handler(pool))
+
 	router.Route("/api/v1", func(api chi.Router) {
 		api.Route("/auth", func(authRouter chi.Router) {
 			// límite estricto solo para login (fuerza bruta sobre credenciales);
@@ -104,6 +129,8 @@ func run(log *slog.Logger) error {
 			authRouter.Group(func(strict chi.Router) {
 				strict.Use(httpserver.RateLimit(10, 5))
 				strict.Post("/login", authHandlers.Login)
+				strict.Post("/forgot-password", authHandlers.ForgotPassword)
+				strict.Post("/reset-password", authHandlers.ResetPassword)
 			})
 			authRouter.Group(func(normal chi.Router) {
 				normal.Use(httpserver.RateLimit(60, 20))

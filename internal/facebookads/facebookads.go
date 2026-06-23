@@ -117,6 +117,12 @@ type oauthStateEntry struct {
 	expiresAt time.Time
 }
 
+// JobEnqueuer encola jobs de publicación. La implementación real usa River;
+// puede ser nil en dev (cae en goroutine) o en tests.
+type JobEnqueuer interface {
+	EnqueuePublishAd(ctx context.Context, orgID, draftID uuid.UUID) error
+}
+
 type Service struct {
 	pool        *pgxpool.Pool
 	enc         *crypto.Encryptor
@@ -124,6 +130,7 @@ type Service struct {
 	frontendURL string
 	mu          sync.Mutex
 	oauthStates map[string]oauthStateEntry
+	enqueuer    JobEnqueuer // inyectado desde main; nil → goroutine fallback
 }
 
 func NewService(pool *pgxpool.Pool, enc *crypto.Encryptor, redirectURI, frontendURL string) *Service {
@@ -135,6 +142,8 @@ func NewService(pool *pgxpool.Pool, enc *crypto.Encryptor, redirectURI, frontend
 		oauthStates: make(map[string]oauthStateEntry),
 	}
 }
+
+func (s *Service) SetEnqueuer(e JobEnqueuer) { s.enqueuer = e }
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -338,14 +347,48 @@ func (s *Service) CreateAd(ctx context.Context, orgID uuid.UUID, in CreateAdInpu
 		return nil, fmt.Errorf("facebookads: crear borrador: %w", err)
 	}
 
-	// Intentar publicar en Meta en background — error de Graph API no falla el request
-	go func() {
-		bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		s.publishToMeta(bgCtx, orgID, &draft)
-	}()
+	// Encolar job durable (River) o goroutine de emergencia si no hay enqueuer.
+	draftCopy := draft
+	if s.enqueuer != nil {
+		if err := s.enqueuer.EnqueuePublishAd(context.Background(), orgID, draft.ID); err != nil {
+			go func() {
+				bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				s.publishToMeta(bgCtx, orgID, &draftCopy)
+			}()
+		}
+	} else {
+		go func() {
+			bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			s.publishToMeta(bgCtx, orgID, &draftCopy)
+		}()
+	}
 
 	return &draft, nil
+}
+
+// ExecutePublishAd es la entrada del worker River. Carga el draft y llama publishToMeta.
+func (s *Service) ExecutePublishAd(ctx context.Context, orgID, draftID uuid.UUID) error {
+	var draft AdDraft
+	draft.OrganizationID = orgID
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, vacancy_id, campaign_name, objective, daily_budget_cents,
+		       ad_title, ad_body, link_url, status, campaign_id, ad_set_id, ad_id, created_at
+		FROM facebook_ad_drafts
+		WHERE id = $1 AND organization_id = $2 AND status = 'Borrador'`,
+		draftID, orgID,
+	).Scan(
+		&draft.ID, &draft.VacancyID, &draft.CampaignName, &draft.Objective, &draft.DailyBudgetCents,
+		&draft.AdTitle, &draft.AdBody, &draft.LinkURL, &draft.Status,
+		&draft.CampaignID, &draft.AdSetID, &draft.AdID, &draft.CreatedAt,
+	)
+	if err != nil {
+		// draft no encontrado o ya procesado → no reintentar
+		return nil
+	}
+	s.publishToMeta(ctx, orgID, &draft)
+	return nil
 }
 
 func (s *Service) SetAdStatus(ctx context.Context, orgID, adID uuid.UUID, status string) (*AdDraft, error) {

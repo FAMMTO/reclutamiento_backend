@@ -21,6 +21,7 @@ tags:
   - name: vacancies
   - name: candidates
   - name: rutas
+  - name: facebookads
   - name: public
   - name: ops
 
@@ -492,6 +493,308 @@ paths:
       responses:
         "200": { description: ok }
 
+  /api/v1/summary:
+    get:
+      tags: [ops]
+      summary: Métricas de negocio de la organización autenticada
+      description: >
+        Devuelve conteos reales de candidatos, vacantes (por estado), compañías,
+        reclutadores activos y pipeline de postulaciones. Requiere sesión activa.
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  summary: { $ref: "#/components/schemas/OrgSummary" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /api/v1/facebookads/config:
+    get:
+      tags: [facebookads]
+      summary: Obtener configuración de Meta Ads (sin exponer secretos)
+      description: >
+        Devuelve la configuración de la organización. Los campos `appSecretSet`
+        y `accessTokenSet` indican si hay un valor cifrado; los textos planos
+        nunca se exponen. Si no existe configuración, devuelve valores por defecto.
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  config: { $ref: "#/components/schemas/FbConfig" }
+        "401": { $ref: "#/components/responses/Error" }
+    put:
+      tags: [facebookads]
+      summary: Guardar configuración de Meta Ads (upsert)
+      description: >
+        Upsert de la configuración. Campos `appSecret` y `accessToken` vacíos
+        conservan el valor cifrado anterior. Guardar una nueva config resetea
+        `isConnected=false`.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FbSaveConfigInput" }
+      responses:
+        "200":
+          description: Guardado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  config: { $ref: "#/components/schemas/FbConfig" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /api/v1/facebookads/test:
+    post:
+      tags: [facebookads]
+      summary: Probar conexión con Meta Graph API
+      description: >
+        Llama GET /act_{adAccountId} desde el servidor y actualiza `isConnected`
+        según el resultado. Requiere access token y ad_account_id configurados.
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Conexión exitosa
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accountName: { type: string }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /api/v1/facebookads/oauth/url:
+    get:
+      tags: [facebookads]
+      summary: Generar URL de autorización OAuth de Meta
+      description: >
+        Construye la URL del diálogo de OAuth de Facebook con CSRF state (10 min
+        TTL en memoria). El frontend redirige el navegador a esta URL para
+        iniciar el flujo SSO.
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url: { type: string, format: uri }
+        "400":
+          description: App ID no configurado
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /api/v1/facebookads/oauth/callback:
+    get:
+      tags: [facebookads]
+      summary: Callback OAuth de Meta (público — el browser llega aquí)
+      description: >
+        Meta redirige el navegador a este endpoint tras la autorización. Valida
+        el CSRF state, intercambia el código por un long-lived token (60 días) y
+        lo cifra con AES-GCM en DB. Redirige al frontend con `?fb=connected` o
+        `?fb=error`. **No requiere JWT** (es un redirect del browser).
+      parameters:
+        - { name: code,  in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string } }
+        - { name: error, in: query, schema: { type: string } }
+      responses:
+        "302":
+          description: Redirect al frontend con ?fb=connected o ?fb=error
+
+  /api/v1/facebookads/accounts:
+    get:
+      tags: [facebookads]
+      summary: Listar cuentas publicitarias accesibles vía el token actual
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accounts:
+                    type: array
+                    items: { $ref: "#/components/schemas/FbAdAccount" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /api/v1/facebookads/pages:
+    get:
+      tags: [facebookads]
+      summary: Listar páginas de Facebook administradas por el usuario del token
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pages:
+                    type: array
+                    items: { $ref: "#/components/schemas/FbPage" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /api/v1/facebookads/selection:
+    put:
+      tags: [facebookads]
+      summary: Guardar cuenta publicitaria y página seleccionadas
+      description: >
+        Actualiza `ad_account_id` y `page_id` sin resetear `isConnected`.
+        La conexión OAuth sigue válida.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [adAccountId, pageId]
+              properties:
+                adAccountId: { type: string }
+                pageId: { type: string }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  config: { $ref: "#/components/schemas/FbConfig" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { description: configuración no encontrada }
+
+  /api/v1/facebookads/disconnect:
+    post:
+      tags: [facebookads]
+      summary: Desconectar Meta — borra el access token y resetea el estado
+      description: >
+        Limpia `access_token_enc`, `ad_account_id`, `page_id` y pone
+        `is_connected=false`. El App ID y App Secret se conservan.
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { ok: { type: boolean } }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /api/v1/facebookads/ads:
+    get:
+      tags: [facebookads]
+      summary: Listar borradores de anuncios de la organización
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ads:
+                    type: array
+                    items: { $ref: "#/components/schemas/FbAdDraft" }
+        "401": { $ref: "#/components/responses/Error" }
+    post:
+      tags: [facebookads]
+      summary: Crear borrador de anuncio y encolarlo para publicación en Meta
+      description: >
+        Persiste el borrador con status `Borrador` y encola un job River para
+        publicarlo en Meta (campaign → adset → creative → ad). Si River no está
+        disponible, cae en goroutine de emergencia. El draft se actualiza con los
+        IDs de Meta si la publicación es exitosa, o queda en status `Error`.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FbCreateAdInput" }
+      responses:
+        "201":
+          description: Borrador creado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ad: { $ref: "#/components/schemas/FbAdDraft" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /api/v1/facebookads/ads/{id}:
+    patch:
+      tags: [facebookads]
+      summary: Cambiar estado de un borrador de anuncio
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [Borrador, Publicado, Pausado, Error]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ad: { $ref: "#/components/schemas/FbAdDraft" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { description: anuncio no encontrado }
+    delete:
+      tags: [facebookads]
+      summary: Eliminar borrador de anuncio
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { ok: { type: boolean } }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { description: anuncio no encontrado }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -600,3 +903,98 @@ components:
             properties:
               question: { type: string }
               answer: { type: string, maxLength: 4000 }
+
+    OrgSummary:
+      type: object
+      properties:
+        candidates: { type: integer }
+        vacancies:
+          type: object
+          properties:
+            draft:     { type: integer }
+            published: { type: integer }
+            closed:    { type: integer }
+        companies:  { type: integer }
+        recruiters: { type: integer }
+        pipeline:
+          type: object
+          properties:
+            nueva:      { type: integer }
+            en_revision: { type: integer }
+            entrevista: { type: integer }
+            rechazada:  { type: integer }
+            contratada: { type: integer }
+
+    FbConfig:
+      type: object
+      properties:
+        id:             { type: string, format: uuid }
+        appId:          { type: string }
+        appSecretSet:   { type: boolean, description: "true = hay AppSecret cifrado; el plaintext nunca se expone" }
+        accessTokenSet: { type: boolean }
+        adAccountId:    { type: string }
+        pageId:         { type: string }
+        businessId:     { type: string }
+        apiVersion:     { type: string, example: "v23.0" }
+        isConnected:    { type: boolean }
+        connectedAt:    { type: string, format: date-time, nullable: true }
+        updatedAt:      { type: string, format: date-time }
+
+    FbSaveConfigInput:
+      type: object
+      properties:
+        appId:       { type: string }
+        appSecret:   { type: string, description: "Vacío = conservar valor cifrado anterior" }
+        accessToken: { type: string, description: "Vacío = conservar valor cifrado anterior" }
+        adAccountId: { type: string }
+        pageId:      { type: string }
+        businessId:  { type: string }
+        apiVersion:  { type: string, default: "v23.0" }
+
+    FbAdAccount:
+      type: object
+      properties:
+        id:     { type: string }
+        name:   { type: string }
+        status: { type: integer, description: "1=activa, 2=desactivada, 3=no pagada, etc." }
+
+    FbPage:
+      type: object
+      properties:
+        id:   { type: string }
+        name: { type: string }
+
+    FbAdDraft:
+      type: object
+      properties:
+        id:               { type: string, format: uuid }
+        vacancyId:        { type: string, format: uuid, nullable: true }
+        campaignName:     { type: string }
+        objective:
+          type: string
+          enum: [OUTCOME_TRAFFIC, OUTCOME_LEADS, OUTCOME_AWARENESS, OUTCOME_ENGAGEMENT]
+        dailyBudgetCents: { type: integer, description: "Presupuesto diario en centavos (MXN)" }
+        adTitle:          { type: string }
+        adBody:           { type: string }
+        linkUrl:          { type: string, format: uri }
+        status:
+          type: string
+          enum: [Borrador, Publicado, Pausado, Error]
+        campaignId: { type: string, nullable: true }
+        adSetId:    { type: string, nullable: true }
+        adId:       { type: string, nullable: true }
+        createdAt:  { type: string, format: date-time }
+
+    FbCreateAdInput:
+      type: object
+      required: [campaignName, objective, dailyBudgetCents, adTitle, adBody, linkUrl]
+      properties:
+        vacancyId:        { type: string, format: uuid }
+        campaignName:     { type: string, maxLength: 200 }
+        objective:
+          type: string
+          enum: [OUTCOME_TRAFFIC, OUTCOME_LEADS, OUTCOME_AWARENESS, OUTCOME_ENGAGEMENT]
+        dailyBudgetCents: { type: integer, minimum: 1 }
+        adTitle:          { type: string, maxLength: 200 }
+        adBody:           { type: string }
+        linkUrl:          { type: string, format: uri }

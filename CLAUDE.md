@@ -19,9 +19,10 @@ Plan maestro: `../PLAN_DE_ACCION.md` (arquitectura, esquema de DB, fases y crite
 
 ## Grafo del proyecto
 
-> Última actualización: 2026-06-11 — Fases 1-4 implementadas: auth, reclutadores,
-> compañías, vacantes, rutas, candidatos, postulaciones y Facebook Ads server-side
-> (AES-GCM, Graph API desde el backend). Lo ⬜ es lo que falta y se marca ✅ al construirse.
+> Última actualización: 2026-06-23 — Fases 1-5 implementadas: auth, reclutadores,
+> compañías, vacantes, rutas, candidatos, postulaciones, Facebook Ads server-side
+> (AES-GCM + OAuth SSO + Graph API), reset-password (Resend), métricas de negocio
+> (summary), worker River con deploy systemd. OpenAPI completo.
 
 Estado de nodos: ⬜ planeado · ✅ implementado
 
@@ -29,7 +30,7 @@ Estado de nodos: ⬜ planeado · ✅ implementado
 graph TD
     subgraph Entrypoints
         API["✅ cmd/api (HTTP, solo wiring + seed admin)"]
-        WRK["⬜ cmd/worker (jobs)"]
+        WRK["✅ cmd/worker (River jobs — deploy: infra/jobbly-worker.service)"]
     end
 
     subgraph "internal/ (dominios)"
@@ -40,6 +41,7 @@ graph TD
         CAN["✅ candidates (upsert por org+teléfono,<br/>postulación pública, pipeline de estados)"]
         RUT["✅ rutas (CRUD + N:M ruta_vacancies)"]
         FBA["✅ facebookads (OAuth PKCE + AES-GCM,<br/>discovery cuentas/páginas,<br/>Graph API: campaign→adset→creative→ad)"]
+        SUM["✅ summary (GET /api/v1/summary — conteos reales por org)"]
     end
 
     subgraph "internal/platform"
@@ -51,24 +53,24 @@ graph TD
         CRY["✅ crypto (AES-256-GCM, ENCRYPTION_KEY 32B)"]
     end
 
-    PG[("✅ PostgreSQL 16<br/>0001: organizations, recruiters, refresh_tokens, audit_log<br/>0002: companies, vacancies, rutas, ruta_vacancies<br/>0003: candidates, applications<br/>0004: facebook_ads_configs, facebook_ad_drafts")]
-    RIVER["⬜ river (cola de jobs en Postgres)"]
+    PG[("✅ PostgreSQL 16<br/>0001: organizations, recruiters, refresh_tokens, audit_log<br/>0002: companies, vacancies, rutas, ruta_vacancies<br/>0003: candidates, applications<br/>0004: facebook_ads_configs, facebook_ad_drafts<br/>0005: password_reset_tokens")]
+    RIVER["✅ river (cola de jobs en Postgres)"]
     META["Meta Graph API"]
     FE["✅ Frontend RECLUTAMIENTO-AI<br/>(src/lib/api/* consume este API;<br/>contrato: api/openapi.yaml)"]
 
     API --> HTTPS & CFG & DB
-    API --> AUTH & REC & CMP & VAC & CAN & RUT
-    WRK -.-> FBA & RIVER
+    API --> AUTH & REC & CMP & VAC & CAN & RUT & SUM
+    WRK --> FBA & RIVER
     AUTH --> WEB & AUD & HTTPS
     REC --> AUTH & WEB & AUD & HTTPS
     VAC --> CMP
     CAN --> VAC
     RUT --> VAC
-    CMP & VAC & CAN & RUT --> AUTH & WEB & AUD
-    FBA -.-> VAC & CRY & RIVER & META
-    AUTH & REC & CMP & VAC & CAN & RUT --> DB
+    CMP & VAC & CAN & RUT & SUM --> AUTH & WEB & AUD
+    FBA --> VAC & CRY & RIVER & META
+    AUTH & REC & CMP & VAC & CAN & RUT & SUM --> DB
     DB --> PG
-    RIVER -.-> PG
+    RIVER --> PG
     FE --> API
 ```
 
@@ -81,7 +83,7 @@ graph TD
   exponen datos org-internos.
 
 Endpoints vivos:
-`POST /auth/login|refresh|logout|change-password` · `GET /auth/me` ·
+`POST /auth/login|refresh|logout|change-password|forgot-password|reset-password` · `GET /auth/me` ·
 `GET|POST /recruiters` · `PATCH /recruiters/{id}` ·
 `GET|POST /companies` · `PATCH /companies/{id}` ·
 `GET|POST /vacancies` · `GET|PATCH /vacancies/{id}` ·
@@ -93,6 +95,7 @@ Endpoints vivos:
 `GET /facebookads/accounts` · `GET /facebookads/pages` ·
 `PUT /facebookads/selection` · `POST /facebookads/disconnect` ·
 `GET|POST /facebookads/ads` · `PATCH|DELETE /facebookads/ads/{id}` ·
+`GET /summary` ·
 `GET /healthz` · `GET /readyz`
 
 ### Reglas de dependencia (se validan al revisar el grafo)

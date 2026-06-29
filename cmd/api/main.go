@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/FAMMTO/reclutamiento_backend/internal/platform/metrics"
 	"github.com/FAMMTO/reclutamiento_backend/internal/recruiters"
 	"github.com/FAMMTO/reclutamiento_backend/internal/rutas"
+	"github.com/FAMMTO/reclutamiento_backend/internal/summary"
 	"github.com/FAMMTO/reclutamiento_backend/internal/vacancies"
 )
 
@@ -92,6 +94,7 @@ func run(log *slog.Logger) error {
 		fbSvc.SetEnqueuer(enqueuer)
 	}
 	fbHandlers := facebookads.NewHandlers(fbSvc, cfg.FacebookFrontendURL)
+	summaryHandlers := summary.NewHandlers(pool)
 
 	router := chi.NewRouter()
 	router.Use(httpserver.Recover(log))
@@ -113,6 +116,17 @@ func run(log *slog.Logger) error {
 	router.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		if err := pool.Ping(r.Context()); err != nil {
 			http.Error(w, "db no disponible", http.StatusServiceUnavailable)
+			return
+		}
+		// Comprobar jobs de River atascados (en estado 'running' por más de 10 min indica worker caído)
+		var stuckJobs int
+		_ = pool.QueryRow(r.Context(),
+			`SELECT count(*) FROM river_jobs WHERE state='running' AND attempted_at < now() - interval '10 minutes'`,
+		).Scan(&stuckJobs)
+		if stuckJobs > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"ok":false,"reason":"river_stuck_jobs","count":` + strconv.Itoa(stuckJobs) + `}`))
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -174,6 +188,8 @@ func run(log *slog.Logger) error {
 			protected.Get("/candidates", candidateHandlers.ListCandidates)
 			protected.Get("/applications", candidateHandlers.ListApplications)
 			protected.Patch("/applications/{id}", candidateHandlers.SetApplicationStatus)
+
+			protected.Get("/summary", summaryHandlers.Get)
 
 			protected.Get("/rutas", rutaHandlers.List)
 			protected.Post("/rutas", rutaHandlers.Create)
